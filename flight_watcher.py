@@ -2,12 +2,15 @@
 """
 flight_watcher.py
 
-Checks flight prices via the Duffel Flights API and sends an ntfy push
-notification to your phone when the price drops under a threshold.
+Checks flight prices via the Duffel Flights API (with an optional Google
+Flights fallback via SerpApi) and sends an ntfy push notification to your
+phone when the price drops under a threshold.
 
-Designed to be run on a schedule (e.g. via GitHub Actions cron).
-State (the last price we notified about) is kept in state.json so we
-don't spam you every run — only when the price is new/lower.
+Designed to be run on a schedule (e.g. via GitHub Actions cron). Every
+check — not just the ones that notify — is logged to a SQLite database
+(flight_watcher.db) so you have a full price history to query later, and
+that same database is used to figure out whether a new check is a new
+low (so we don't spam you every run).
 
 Note on currency: Duffel returns offer prices in your Duffel account's
 settlement currency (set in your Duffel dashboard), not a currency you
@@ -18,13 +21,13 @@ providers allow — that's a Duffel API limitation, not a bug here.
 """
 
 import os
-import json
+import sqlite3
 import sys
 from datetime import datetime
 
 import requests
 
-STATE_FILE = "state.json"
+DB_FILE = "flight_watcher.db"
 DUFFEL_API_BASE = "https://api.duffel.com"
 DUFFEL_VERSION = "v2"
 
@@ -37,16 +40,88 @@ def get_env(name, required=True, default=None):
     return val
 
 
-def load_state():
-    if os.path.exists(STATE_FILE):
-        with open(STATE_FILE, "r") as f:
-            return json.load(f)
-    return {}
+def init_db(db_path):
+    """
+    Creates the price_checks table if it doesn't already exist. Every run
+    of the script logs one row here — a full history of every price this
+    script has ever observed, not just the ones that triggered a notification.
+    """
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS price_checks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            checked_at TEXT NOT NULL,        -- UTC ISO 8601 timestamp of this check
+            origin TEXT NOT NULL,
+            destination TEXT NOT NULL,
+            depart_date TEXT NOT NULL,
+            return_date TEXT NOT NULL DEFAULT '',  -- '' for one-way trips
+            source TEXT NOT NULL,            -- "Duffel" or "Google Flights (via SerpApi)"
+            native_price REAL NOT NULL,
+            native_currency TEXT NOT NULL,
+            converted_price REAL NOT NULL,   -- native_price converted into target_currency
+            target_currency TEXT NOT NULL,
+            max_price REAL NOT NULL,         -- the MAX_PRICE threshold active at check time
+            notified INTEGER NOT NULL DEFAULT 0  -- 1 if this check triggered a notification
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_price_checks_route
+        ON price_checks (origin, destination, depart_date, return_date)
+        """
+    )
+    conn.commit()
+    return conn
 
 
-def save_state(state):
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2)
+def log_price_check(conn, *, origin, destination, depart_date, return_date,
+                     source, native_price, native_currency,
+                     converted_price, target_currency, max_price, notified):
+    """Inserts one row for this run's price check, regardless of whether it notified."""
+    conn.execute(
+        """
+        INSERT INTO price_checks (
+            checked_at, origin, destination, depart_date, return_date,
+            source, native_price, native_currency,
+            converted_price, target_currency, max_price, notified
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            datetime.utcnow().isoformat(),
+            origin,
+            destination,
+            depart_date,
+            return_date or "",
+            source,
+            native_price,
+            native_currency,
+            converted_price,
+            target_currency,
+            max_price,
+            1 if notified else 0,
+        ),
+    )
+    conn.commit()
+
+
+def get_last_notified_price(conn, origin, destination, depart_date, return_date):
+    """
+    Returns the converted_price of the most recent check for this exact route
+    that triggered a notification, or None if we've never notified for it.
+    """
+    row = conn.execute(
+        """
+        SELECT converted_price FROM price_checks
+        WHERE origin = ? AND destination = ? AND depart_date = ? AND return_date = ?
+          AND notified = 1
+        ORDER BY checked_at DESC
+        LIMIT 1
+        """,
+        (origin, destination, depart_date, return_date or ""),
+    ).fetchone()
+    return row[0] if row else None
 
 
 def search_flights(api_key, origin, destination, depart_date, return_date, adults):
@@ -231,8 +306,7 @@ def main():
     adults = int(get_env("ADULTS", required=False, default="1"))
     serpapi_key = get_env("SERPAPI_API_KEY", required=False, default=None)
 
-    state = load_state()
-    route_key = f"{origin}-{destination}-{depart_date}-{return_date}"
+    db_conn = init_db(DB_FILE)
 
     offers = []
     try:
@@ -253,11 +327,13 @@ def main():
         )
         if not fallback:
             print("No offers found via Duffel or the SerpApi fallback.")
+            db_conn.close()
             return
         native_price, native_currency = fallback
         source = "Google Flights (via SerpApi)"
     else:
         print("No offers found via Duffel, and SERPAPI_API_KEY is not set so no fallback was tried.")
+        db_conn.close()
         return
 
     if native_currency == target_currency:
@@ -276,7 +352,7 @@ def main():
     print(f"[{source}] Cheapest offer: {native_price:.2f} {native_currency}"
           + (f" (~{price:.2f} {target_currency})" if native_currency != target_currency else ""))
 
-    last_notified = state.get(route_key, {}).get("last_notified_price")
+    last_notified = get_last_notified_price(db_conn, origin, destination, depart_date, return_date)
     should_notify = price <= max_price and (last_notified is None or price < last_notified)
 
     if should_notify:
@@ -304,17 +380,25 @@ def main():
         )
         send_ntfy_notification(ntfy_topic, title, message, priority="high", ntfy_server=ntfy_server)
         print("Notification sent.")
-
-        state[route_key] = {
-            "last_notified_price": price,
-            "last_checked": datetime.utcnow().isoformat(),
-        }
-        save_state(state)
     else:
         print(f"No notification (price {price:.2f} {target_currency} vs max {max_price}, "
               f"last notified {last_notified}).")
-        state.setdefault(route_key, {})["last_checked"] = datetime.utcnow().isoformat()
-        save_state(state)
+
+    log_price_check(
+        db_conn,
+        origin=origin,
+        destination=destination,
+        depart_date=depart_date,
+        return_date=return_date,
+        source=source,
+        native_price=native_price,
+        native_currency=native_currency,
+        converted_price=price,
+        target_currency=target_currency,
+        max_price=max_price,
+        notified=should_notify,
+    )
+    db_conn.close()
 
 
 if __name__ == "__main__":

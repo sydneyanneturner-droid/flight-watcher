@@ -7,7 +7,7 @@ on:
   workflow_dispatch: {}   # lets you manually trigger a run from the Actions tab
 
 permissions:
-  contents: write   # needed so the workflow can commit updated state.json
+  contents: write   # needed so the workflow can commit the updated database
 
 jobs:
   check-flights:
@@ -37,10 +37,10 @@ jobs:
           CURRENCY: ${{ vars.CURRENCY }}
         run: python flight_watcher.py
 
-      - name: Commit updated state
+      - name: Commit updated database
         run: |
           git config user.name "flight-watcher-bot"
           git config user.email "actions@github.com"
-          git add state.json
-          git diff --quiet --cached || git commit -m "Update price state [skip ci]"
+          git add flight_watcher.db
+          git diff --quiet --cached || git commit -m "Update price history [skip ci]"
           git push
