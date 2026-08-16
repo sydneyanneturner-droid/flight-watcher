@@ -282,7 +282,10 @@ def convert(amount, from_currency, to_currency):
 
 
 def send_ntfy_notification(topic, title, message, priority="default", ntfy_server="https://ntfy.sh"):
-    url = f"{ntfy_server}/{topic}"
+    # URL-encode the topic in case it has been mistyped with spaces/special
+    # characters — ntfy topics must be plain alphanumerics/hyphens/underscores.
+    from urllib.parse import quote
+    url = f"{ntfy_server}/{quote(topic.strip(), safe='')}"
     headers = {
         "Title": title.encode("utf-8"),
         "Priority": priority,
@@ -354,12 +357,22 @@ def main():
 
     last_notified = get_last_notified_price(db_conn, origin, destination, depart_date, return_date)
     should_notify = price <= max_price and (last_notified is None or price < last_notified)
+    actually_notified = False
 
     if should_notify:
-        gf_link = (
-            f"https://www.google.com/travel/flights?q=Flights%20from%20{origin}"
-            f"%20to%20{destination}%20on%20{depart_date}"
-        )
+        # Kayak's deep-link format is simple and documented, and — unlike
+        # Google's `/travel/flights?q=...` natural-language links — reliably
+        # lands on the specific route/dates rather than a restricted/verification
+        # page. That said, Kayak (like most travel metasearch sites) does run
+        # its own bot-detection, so an occasional "confirm you're human" check
+        # is still possible, especially in an embedded in-app browser (like
+        # ntfy's) rather than a normal Safari session. If that happens, opening
+        # the link in Safari directly usually clears it.
+        booking_link = f"https://www.kayak.com/flights/{origin}-{destination}/{depart_date}"
+        if return_date:
+            booking_link += f"/{return_date}"
+        booking_link += f"/{adults}adults?sort=bestflight_a"
+
         title = f"✈️ {origin}→{destination} for ~{price:.0f} {target_currency}!"
 
         currency_note = ""
@@ -375,11 +388,21 @@ def main():
             f"Source: {source}\n"
             f"Depart: {depart_date}"
             + (f"\nReturn: {return_date}" if return_date else "")
-            + f"\n\nCheck it: {gf_link}"
+            + f"\n\nCheck it: {booking_link}"
+            + "\n(If that link asks you to verify you're human, tap to open in Safari instead of staying in this app.)"
             + currency_note
         )
-        send_ntfy_notification(ntfy_topic, title, message, priority="high", ntfy_server=ntfy_server)
-        print("Notification sent.")
+        try:
+            send_ntfy_notification(ntfy_topic, title, message, priority="high", ntfy_server=ntfy_server)
+            print("Notification sent.")
+            actually_notified = True
+        except requests.RequestException as e:
+            # Don't let a notification failure lose this run's data or crash the
+            # workflow before the database gets committed. We deliberately leave
+            # actually_notified False here so the *next* run will still see this
+            # as a price worth notifying about and retry, instead of silently
+            # giving up on a fare we never actually told you about.
+            print(f"WARNING: found a qualifying price but the ntfy notification failed: {e}", file=sys.stderr)
     else:
         print(f"No notification (price {price:.2f} {target_currency} vs max {max_price}, "
               f"last notified {last_notified}).")
@@ -396,7 +419,7 @@ def main():
         converted_price=price,
         target_currency=target_currency,
         max_price=max_price,
-        notified=should_notify,
+        notified=actually_notified,
     )
     db_conn.close()
 
