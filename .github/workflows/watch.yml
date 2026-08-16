@@ -1,0 +1,46 @@
+name: Flight Price Watcher
+
+on:
+  schedule:
+    # Runs every 2 hours. Adjust as you like (cron is UTC).
+    - cron: "0 */2 * * *"
+  workflow_dispatch: {}   # lets you manually trigger a run from the Actions tab
+
+permissions:
+  contents: write   # needed so the workflow can commit updated state.json
+
+jobs:
+  check-flights:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run flight watcher
+        env:
+          DUFFEL_API_KEY: ${{ secrets.DUFFEL_API_KEY }}
+          SERPAPI_API_KEY: ${{ secrets.SERPAPI_API_KEY }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          ORIGIN: ${{ vars.ORIGIN }}
+          DESTINATION: ${{ vars.DESTINATION }}
+          DEPART_DATE: ${{ vars.DEPART_DATE }}
+          RETURN_DATE: ${{ vars.RETURN_DATE }}
+          MAX_PRICE: ${{ vars.MAX_PRICE }}
+          CURRENCY: ${{ vars.CURRENCY }}
+        run: python flight_watcher.py
+
+      - name: Commit updated state
+        run: |
+          git config user.name "flight-watcher-bot"
+          git config user.email "actions@github.com"
+          git add state.json
+          git diff --quiet --cached || git commit -m "Update price state [skip ci]"
+          git push
