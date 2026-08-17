@@ -2,22 +2,21 @@
 """
 flight_watcher.py
 
-Checks flight prices via the Duffel Flights API (with an optional Google
-Flights fallback via SerpApi) and sends an ntfy push notification to your
-phone when the price drops under a threshold.
+Checks flight prices — primarily via Google Flights (through SerpApi) —
+and sends an ntfy push notification to your phone when the price drops
+under a threshold.
+
+Duffel is supported as an optional secondary source, but only if you've
+activated live mode there (a real identity/KYC process, since Duffel is
+a regulated booking platform). A Duffel *test-mode* key is detected and
+skipped automatically, since test-mode prices are synthetic sandbox
+data, not real fares — using them would silently report fake prices.
 
 Designed to be run on a schedule (e.g. via GitHub Actions cron). Every
 check — not just the ones that notify — is logged to a SQLite database
 (flight_watcher.db) so you have a full price history to query later, and
 that same database is used to figure out whether a new check is a new
 low (so we don't spam you every run).
-
-Note on currency: Duffel returns offer prices in your Duffel account's
-settlement currency (set in your Duffel dashboard), not a currency you
-choose per-request. This script converts that price into your target
-CURRENCY for comparison/display using live exchange rates, but it can't
-"shop" the same search across multiple currencies the way some other
-providers allow — that's a Duffel API limitation, not a bug here.
 """
 
 import os
@@ -26,6 +25,8 @@ import sys
 from datetime import datetime
 
 import requests
+
+DUFFEL_TEST_KEY_PREFIX = "duffel_test_"
 
 DB_FILE = "flight_watcher.db"
 DUFFEL_API_BASE = "https://api.duffel.com"
@@ -296,7 +297,18 @@ def send_ntfy_notification(topic, title, message, priority="default", ntfy_serve
 
 
 def main():
-    api_key = get_env("DUFFEL_API_KEY")
+    # SerpApi (Google Flights) is the primary source: it's real, live pricing
+    # with no identity/KYC verification required — a much better fit for a
+    # personal, search-only project than a full booking platform.
+    serpapi_key = get_env("SERPAPI_API_KEY")
+
+    # Duffel is optional. It's only usable here if you've completed Duffel's
+    # live-mode activation (their real identity verification process) and
+    # are using a duffel_live_ token. A duffel_test_ token is detected and
+    # skipped automatically below, since test-mode prices are synthetic
+    # sandbox data, not real fares.
+    api_key = get_env("DUFFEL_API_KEY", required=False, default=None)
+
     ntfy_topic = get_env("NTFY_TOPIC")
     ntfy_server = get_env("NTFY_SERVER", required=False, default="https://ntfy.sh")
 
@@ -307,37 +319,43 @@ def main():
     max_price = float(get_env("MAX_PRICE"))   # interpreted in CURRENCY (your target currency)
     target_currency = get_env("CURRENCY", required=False, default="USD")
     adults = int(get_env("ADULTS", required=False, default="1"))
-    serpapi_key = get_env("SERPAPI_API_KEY", required=False, default=None)
 
     db_conn = init_db(DB_FILE)
 
-    offers = []
-    try:
-        offers = search_flights(api_key, origin, destination, depart_date, return_date, adults)
-    except requests.RequestException as e:
-        print(f"Duffel API request failed: {e}", file=sys.stderr)
+    native_price = None
+    native_currency = None
+    source = None
 
-    best = cheapest_offer(offers)
-    source = "Duffel"
+    # Try Duffel first ONLY if it's a genuine live-mode key.
+    if api_key and api_key.startswith(DUFFEL_TEST_KEY_PREFIX):
+        print(
+            "DUFFEL_API_KEY is a TEST-mode token — its prices are synthetic sandbox "
+            "data, not real fares. Skipping Duffel and using SerpApi (Google Flights) instead.",
+            file=sys.stderr,
+        )
+    elif api_key:
+        try:
+            offers = search_flights(api_key, origin, destination, depart_date, return_date, adults)
+            best = cheapest_offer(offers)
+            if best:
+                native_price = float(best["total_amount"])
+                native_currency = best["total_currency"]
+                source = "Duffel"
+        except requests.RequestException as e:
+            print(f"Duffel API request failed: {e}", file=sys.stderr)
 
-    if best:
-        native_price = float(best["total_amount"])
-        native_currency = best["total_currency"]
-    elif serpapi_key:
-        print("No Duffel offers found — trying Google Flights via SerpApi as a fallback...")
+    # Fall back to (or primarily use) SerpApi/Google Flights if Duffel didn't
+    # produce a usable, real result.
+    if native_price is None:
         fallback = search_google_flights_fallback(
             serpapi_key, origin, destination, depart_date, return_date, target_currency, adults
         )
         if not fallback:
-            print("No offers found via Duffel or the SerpApi fallback.")
+            print("No offers found.")
             db_conn.close()
             return
         native_price, native_currency = fallback
         source = "Google Flights (via SerpApi)"
-    else:
-        print("No offers found via Duffel, and SERPAPI_API_KEY is not set so no fallback was tried.")
-        db_conn.close()
-        return
 
     if native_currency == target_currency:
         price = native_price
