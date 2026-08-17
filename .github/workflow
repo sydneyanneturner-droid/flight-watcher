@@ -1,0 +1,75 @@
+name: Flight Price Watcher
+
+on:
+  schedule:
+    # Runs every 3 hours (~240 checks/month), to stay just under a
+    # 250 searches/month SerpApi plan. Cron is UTC. If your plan's limit
+    # is different, adjust the interval to match (see README).
+    - cron: "0 */3 * * *"
+  workflow_dispatch: {}   # lets you manually trigger a run from the Actions tab
+
+permissions:
+  contents: write   # needed so the workflow can commit the updated database
+
+jobs:
+  check-flights:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run flight watcher
+        env:
+          DUFFEL_API_KEY: ${{ secrets.DUFFEL_API_KEY }}
+          SERPAPI_API_KEY: ${{ secrets.SERPAPI_API_KEY }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          ORIGIN: ${{ vars.ORIGIN }}
+          DESTINATION: ${{ vars.DESTINATION }}
+          DEPART_DATE: ${{ vars.DEPART_DATE }}
+          RETURN_DATE: ${{ vars.RETURN_DATE }}
+          MAX_PRICE: ${{ vars.MAX_PRICE }}
+          CURRENCY: ${{ vars.CURRENCY }}
+        run: python flight_watcher.py
+
+      - name: Commit updated database
+        run: |
+          git config user.name "flight-watcher-bot"
+          git config user.email "actions@github.com"
+          git add flight_watcher.db
+
+          if git diff --quiet --cached; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git commit -m "Update price history [skip ci]"
+
+          BRANCH="${{ github.ref_name }}"
+          for attempt in 1 2 3 4 5; do
+            git fetch origin "$BRANCH"
+            # -X ours: if another run's commit conflicts with this one on the
+            # database file, keep this run's version rather than failing outright.
+            # Losing a single historical row on a rare race is harmless; a broken
+            # workflow every few runs is not.
+            if git merge -X ours --no-edit "origin/$BRANCH"; then
+              if git push origin "HEAD:$BRANCH"; then
+                echo "Push succeeded on attempt $attempt."
+                exit 0
+              fi
+            else
+              git merge --abort || true
+            fi
+            echo "Push attempt $attempt failed (likely a race with another run) — retrying..."
+            sleep $(( (RANDOM % 10) + 5 ))
+          done
+
+          echo "ERROR: failed to push after multiple retries."
+          exit 1
