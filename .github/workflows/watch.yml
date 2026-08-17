@@ -2,8 +2,9 @@ name: Flight Price Watcher
 
 on:
   schedule:
-    # Runs every 2 hours. Adjust as you like (cron is UTC).
-    - cron: "0 */2 * * *"
+    # Runs every 8 hours (~90 checks/month), to stay within SerpApi's 100
+    # free searches/month now that it's the primary data source. Cron is UTC.
+    - cron: "0 */8 * * *"
   workflow_dispatch: {}   # lets you manually trigger a run from the Actions tab
 
 permissions:
