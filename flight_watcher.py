@@ -28,7 +28,7 @@ import requests
 
 DUFFEL_TEST_KEY_PREFIX = "duffel_test_"
 
-DB_FILE = "flight_watcher.db"
+DB_FILE = "flight_watcher(sept).db"
 DUFFEL_API_BASE = "https://api.duffel.com"
 DUFFEL_VERSION = "v2"
 
